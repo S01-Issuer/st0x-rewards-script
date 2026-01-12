@@ -1,0 +1,16 @@
+{
+	"exclude": ["lib/**/*", "node_modules/**/*"],
+
+	"compilerOptions": {
+		"target": "ES2020",
+		"allowJs": true,
+		"checkJs": true,
+		"esModuleInterop": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"skipLibCheck": true,
+		"sourceMap": true,
+		"strict": true,
+		"moduleResolution": "node"
+	}
+}

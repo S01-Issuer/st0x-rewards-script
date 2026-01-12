@@ -1,0 +1,47 @@
+{
+    "name": "ioen-script",
+    "version": "1.0.0",
+    "description": "",
+    "main": "index.js",
+    "directories": {
+      "lib": "lib"
+    },
+    "scripts": {
+      "test": "echo \"Error: no test specified\" && exit 1",
+      "start": "ts-node src/v2.ts"
+    },
+    "repository": {
+      "type": "git",
+      "url": "git+https://github.com/h20liquidity/ioen-script.git"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "bugs": {
+      "url": "https://github.com/h20liquidity/ioen-script/issues"
+    },
+    "homepage": "https://github.com/h20liquidity/ioen-script#readme",
+    "devDependencies": {
+      "@types/pako": "^2.0.3",
+      "@typescript-eslint/eslint-plugin": "^6.0.0",
+      "@typescript-eslint/parser": "^6.0.0",
+      "cbor-web": "^9.0.1",
+      "typescript": "^5.4.3",
+      "typescript-eslint": "^7.3.1"
+    },
+    "dependencies": {
+      "@safe-global/api-kit": "^4.0.0",
+      "@safe-global/protocol-kit": "^6.1.1",
+      "@wagmi/connectors": "^5.0.14",
+      "@wagmi/core": "^2.6.17",
+      "axios": "^1.6.7",
+      "csv-parse": "^6.1.0",
+      "dotenv": "^17.0.0",
+      "ethers": "^6.10.0",
+      "pako": "^2.1.0",
+      "pinata-web3": "^0.4.1",
+      "truncate-eth-address": "^1.0.2",
+      "viem": "^2.37.3"
+    }
+  }
+  
