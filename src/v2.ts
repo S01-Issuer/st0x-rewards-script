@@ -5,17 +5,17 @@ import path from 'path';
 import dotenv from 'dotenv';
 dotenv.config();
 
-const FROM_BLOCK = 38766575;
-const TO_BLOCK = 40304088;
+const FROM_BLOCK = 39557809;
+const TO_BLOCK = 40719263;
 
 const HYPERSYNC_API_KEY = process.env.HYPERSYNC_API_KEY;
 // Using chain-id 1 for Ethereum mainnet (adjust if needed)
 const CHAIN_ID = 8453;
 const HYPERSYNC_URL = `https://${CHAIN_ID}.hypersync.xyz/query`;
 
-const CL_POOL = "0xA0d736dd7386230DE3Aa2e6b4F60d36a5ded2291";
+const CL_POOL = "0xb804FA2e3631465455594538067001E7A0f83D37";
 // Based on the images, Transfer events are from the NFT contract
-const NFT_CONTRACT = "0xA0d736dd7386230DE3Aa2e6b4F60d36a5ded2291";
+const NFT_CONTRACT = "0xb804FA2e3631465455594538067001E7A0f83D37";
 
 // Mint event signature for v2: Mint(address indexed sender, uint256 amount0, uint256 amount1)
 const MINT_EVENT_SIGNATURE = ethers.id("Mint(address,uint256,uint256)");
@@ -384,11 +384,15 @@ async function main() {
 	let totalBurnEvents = 0;
 	let matchedMintCount = 0;
 	let unmatchedMintCount = 0;
+	let matchedBurnCount = 0;
+	let unmatchedBurnCount = 0;
 
-	// Step 1: Fetch and index Transfer events (minimal memory - store 'to' address and log index for precise matching)
+	// Step 1: Fetch and index Transfer events (minimal memory - store transfer details for precise matching)
 	console.log("Querying Transfer events from NFT contract...");
-	// Store transfers with log index for precise matching: tx hash -> array of {to, logIndex}
-	const transferMapByTx = new Map<string, Array<{to: string, logIndex: number}>>();
+	// Store mint transfers (from=0x0): tx hash -> array of {to, value, logIndex}
+	const mintTransferMapByTx = new Map<string, Array<{to: string, value: bigint, logIndex: number}>>();
+	// Store burn transfers (to=0x0): tx hash -> array of {from, value, logIndex}
+	const burnTransferMapByTx = new Map<string, Array<{from: string, value: bigint, logIndex: number}>>();
 	const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 	let transferCount = 0;
 	
@@ -402,13 +406,25 @@ async function main() {
 			const decoded = decodeTransferEvent(log);
 			if (decoded) {
 				const key = decoded.transactionHash.toLowerCase();
-				// Store all transfer 'to' addresses with log indices per tx where from=0x0 (mint) for matching
+				// Store mint transfers (from=0x0) for matching with Mint events
 				if (decoded.from.toLowerCase() === ZERO_ADDRESS) {
-					if (!transferMapByTx.has(key)) {
-						transferMapByTx.set(key, []);
+					if (!mintTransferMapByTx.has(key)) {
+						mintTransferMapByTx.set(key, []);
 					}
-					transferMapByTx.get(key)!.push({
+					mintTransferMapByTx.get(key)!.push({
 						to: decoded.to,
+						value: decoded.value,
+						logIndex: decoded.logIndex
+					});
+				}
+				// Store burn transfers (to=0x0) for matching with Burn events
+				if (decoded.to.toLowerCase() === ZERO_ADDRESS) {
+					if (!burnTransferMapByTx.has(key)) {
+						burnTransferMapByTx.set(key, []);
+					}
+					burnTransferMapByTx.get(key)!.push({
+						from: decoded.from,
+						value: decoded.value,
 						logIndex: decoded.logIndex
 					});
 				}
@@ -416,11 +432,11 @@ async function main() {
 			}
 		}
 	);
-	console.log(`Processed ${transferCount} Transfer events, indexed ${transferMapByTx.size} unique mint transaction hashes`);
+	console.log(`Processed ${transferCount} Transfer events, indexed ${mintTransferMapByTx.size} unique mint transaction hashes and ${burnTransferMapByTx.size} unique burn transaction hashes`);
 	
-	// Log memory usage warning if transfer map is very large
-	if (transferMapByTx.size > 100000) {
-		console.warn(`[main] Warning: Transfer map has ${transferMapByTx.size} entries. This may use significant memory.`);
+	// Log memory usage warning if transfer maps are very large
+	if (mintTransferMapByTx.size > 100000 || burnTransferMapByTx.size > 100000) {
+		console.warn(`[main] Warning: Transfer maps have ${mintTransferMapByTx.size} mint entries and ${burnTransferMapByTx.size} burn entries. This may use significant memory.`);
 	}
 
 	// Step 2: Fetch Mint events, match on-the-fly, and write immediately
@@ -436,13 +452,13 @@ async function main() {
 			if (decoded) {
 				totalMintEvents++;
 				const txHash = decoded.transactionHash.toLowerCase();
-				const availableTransfers = transferMapByTx.get(txHash) || [];
+				const availableTransfers = mintTransferMapByTx.get(txHash) || [];
 				
 				if (availableTransfers.length > 0) {
 					// Precise matching: find the transfer with the closest log index to the mint's log index
 					// Prefer transfers that come after the mint event (logIndex >= mint.logIndex)
 					// If none found, use the closest one overall
-					let bestMatch: {to: string, logIndex: number} | null = null;
+					let bestMatch: {to: string, value: bigint, logIndex: number} | null = null;
 					let bestDistance = Infinity;
 					
 					for (const transfer of availableTransfers) {
@@ -468,12 +484,12 @@ async function main() {
 					}
 					
 					if (bestMatch) {
-						// Write matched mint event as CSV row
+						// Write matched mint event as CSV row with Transfer event value as amount
 						const row = [
 							'mint',
 							decoded.transactionHash,
 							decoded.blockNumber.toString(),
-							'0',
+							bestMatch.value.toString(),
 							decoded.amount0.toString(),
 							decoded.amount1.toString(),
 							bestMatch.to,
@@ -487,7 +503,7 @@ async function main() {
 						
 						// Log if there are multiple mint transfers and we had to choose
 						if (availableTransfers.length > 1) {
-							console.log(`[main] Matched mint (logIndex=${decoded.logIndex}) with transfer (logIndex=${bestMatch.logIndex}, distance=${bestDistance}) in tx ${decoded.transactionHash}`);
+							console.log(`[main] Matched mint (logIndex=${decoded.logIndex}) with transfer (logIndex=${bestMatch.logIndex}, distance=${bestDistance}, value=${bestMatch.value.toString()}) in tx ${decoded.transactionHash}`);
 						}
 						
 						// Remove the matched transfer to avoid reusing it (optional, but helps with multiple mints)
@@ -497,16 +513,44 @@ async function main() {
 						}
 					} else {
 						unmatchedMintCount++;
+						// Write unmatched mint event with amount=0
+						const row = [
+							'mint',
+							decoded.transactionHash,
+							decoded.blockNumber.toString(),
+							'0',
+							decoded.amount0.toString(),
+							decoded.amount1.toString(),
+							decoded.sender, // Use sender as user when no transfer match
+						];
+						const csvRow = row.map(escapeCsvValue).join(',') + '\n';
+						if (!outputFile.write(csvRow)) {
+							outputFile.once('drain', () => {});
+						}
 					}
 				} else {
 					unmatchedMintCount++;
+					// Write unmatched mint event with amount=0
+					const row = [
+						'mint',
+						decoded.transactionHash,
+						decoded.blockNumber.toString(),
+						'0',
+						decoded.amount0.toString(),
+						decoded.amount1.toString(),
+						decoded.sender, // Use sender as user when no transfer match
+					];
+					const csvRow = row.map(escapeCsvValue).join(',') + '\n';
+					if (!outputFile.write(csvRow)) {
+						outputFile.once('drain', () => {});
+					}
 				}
 			}
 		}
 	);
 	console.log(`Processed ${totalMintEvents} Mint events (${matchedMintCount} matched, ${unmatchedMintCount} unmatched)`);
 
-	// Step 3: Fetch Burn events and write immediately
+	// Step 3: Fetch Burn events, match with Transfer events, and write immediately
 	console.log("Querying Burn events from pool contract...");
 	await fetchAndProcessLogs(
 		HYPERSYNC_URL,
@@ -518,25 +562,104 @@ async function main() {
 			const decoded = decodeBurnEvent(log);
 			if (decoded) {
 				totalBurnEvents++;
-				// Write burn event as CSV row
-				const row = [
-					'burn',
-					decoded.transactionHash,
-					decoded.blockNumber.toString(),
-					'0',
-					decoded.amount0.toString(),
-					decoded.amount1.toString(),
-					decoded.to,
-				];
-				const csvRow = row.map(escapeCsvValue).join(',') + '\n';
-				if (!outputFile.write(csvRow)) {
-					// Handle backpressure - wait for drain event
-					outputFile.once('drain', () => {});
+				const txHash = decoded.transactionHash.toLowerCase();
+				const availableTransfers = burnTransferMapByTx.get(txHash) || [];
+				
+				if (availableTransfers.length > 0) {
+					// Precise matching: find the transfer with the closest log index to the burn's log index
+					// Prefer transfers that come after the burn event (logIndex >= burn.logIndex)
+					// If none found, use the closest one overall
+					let bestMatch: {from: string, value: bigint, logIndex: number} | null = null;
+					let bestDistance = Infinity;
+					
+					for (const transfer of availableTransfers) {
+						const distance = Math.abs(transfer.logIndex - decoded.logIndex);
+						// Prefer transfers that come after the burn (they're more likely to be the result)
+						if (transfer.logIndex >= decoded.logIndex) {
+							if (distance < bestDistance) {
+								bestMatch = transfer;
+								bestDistance = distance;
+							}
+						}
+					}
+					
+					// If no transfer found after burn, use the closest one overall
+					if (!bestMatch) {
+						for (const transfer of availableTransfers) {
+							const distance = Math.abs(transfer.logIndex - decoded.logIndex);
+							if (distance < bestDistance) {
+								bestMatch = transfer;
+								bestDistance = distance;
+							}
+						}
+					}
+					
+					if (bestMatch) {
+						// Write matched burn event as CSV row with Transfer event value as amount
+						const row = [
+							'burn',
+							decoded.transactionHash,
+							decoded.blockNumber.toString(),
+							bestMatch.value.toString(),
+							decoded.amount0.toString(),
+							decoded.amount1.toString(),
+							decoded.to,
+						];
+						const csvRow = row.map(escapeCsvValue).join(',') + '\n';
+						if (!outputFile.write(csvRow)) {
+							// Handle backpressure - wait for drain event
+							outputFile.once('drain', () => {});
+						}
+						matchedBurnCount++;
+						
+						// Log if there are multiple burn transfers and we had to choose
+						if (availableTransfers.length > 1) {
+							console.log(`[main] Matched burn (logIndex=${decoded.logIndex}) with transfer (logIndex=${bestMatch.logIndex}, distance=${bestDistance}, value=${bestMatch.value.toString()}) in tx ${decoded.transactionHash}`);
+						}
+						
+						// Remove the matched transfer to avoid reusing it (optional, but helps with multiple burns)
+						const transferIndex = availableTransfers.indexOf(bestMatch);
+						if (transferIndex !== -1) {
+							availableTransfers.splice(transferIndex, 1);
+						}
+					} else {
+						unmatchedBurnCount++;
+						// Write unmatched burn event with amount=0
+						const row = [
+							'burn',
+							decoded.transactionHash,
+							decoded.blockNumber.toString(),
+							'0',
+							decoded.amount0.toString(),
+							decoded.amount1.toString(),
+							decoded.to,
+						];
+						const csvRow = row.map(escapeCsvValue).join(',') + '\n';
+						if (!outputFile.write(csvRow)) {
+							outputFile.once('drain', () => {});
+						}
+					}
+				} else {
+					unmatchedBurnCount++;
+					// Write unmatched burn event with amount=0
+					const row = [
+						'burn',
+						decoded.transactionHash,
+						decoded.blockNumber.toString(),
+						'0',
+						decoded.amount0.toString(),
+						decoded.amount1.toString(),
+						decoded.to,
+					];
+					const csvRow = row.map(escapeCsvValue).join(',') + '\n';
+					if (!outputFile.write(csvRow)) {
+						outputFile.once('drain', () => {});
+					}
 				}
 			}
 		}
 	);
-	console.log(`Processed ${totalBurnEvents} Burn events`);
+	console.log(`Processed ${totalBurnEvents} Burn events (${matchedBurnCount} matched, ${unmatchedBurnCount} unmatched)`);
 
 	// Close the file
 	outputFile.end();
@@ -545,7 +668,8 @@ async function main() {
 	await new Promise((resolve) => outputFile.on('finish', resolve));
 
 	console.log(`[main] Results written to ${outputPath}`);
-	console.log(`Total events: ${matchedMintCount + totalBurnEvents} (${matchedMintCount} matched mints, ${totalBurnEvents} burns)`);
+	console.log(`Total events: ${matchedMintCount + matchedBurnCount} (${matchedMintCount} matched mints, ${matchedBurnCount} matched burns)`);
+	console.log(`Unmatched events: ${unmatchedMintCount} mints, ${unmatchedBurnCount} burns`);
 	console.log("[main] Main function completed successfully");
 }
 
