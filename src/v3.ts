@@ -23,6 +23,10 @@ const MINT_EVENT_SIGNATURE = ethers.id("Mint(address,address,int24,int24,uint128
 const COLLECT_EVENT_SIGNATURE = ethers.id("Collect(address,address,int24,int24,uint128,uint128)");
 // Transfer event signature: Transfer(address indexed from, address indexed to, uint256 indexed tokenId)
 const TRANSFER_EVENT_SIGNATURE = ethers.id("Transfer(address,address,uint256)");
+// IncreaseLiquidity event signature: IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)
+const INCREASE_LIQUIDITY_EVENT_SIGNATURE = ethers.id("IncreaseLiquidity(uint256,uint128,uint256,uint256)");
+// DecreaseLiquidity event signature: DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)
+const DECREASE_LIQUIDITY_EVENT_SIGNATURE = ethers.id("DecreaseLiquidity(uint256,uint128,uint256,uint256)");
 
 console.log('TRANSFER_EVENT_SIGNATURE : ', TRANSFER_EVENT_SIGNATURE);
 
@@ -71,6 +75,28 @@ interface MatchedMintEvent {
 interface MatchedCollectEvent {
 	collect: CollectEvent;
 	transfer: TransferEvent;
+}
+
+interface IncreaseLiquidityEvent {
+	blockNumber: number;
+	transactionHash: string;
+	logIndex: number;
+	tokenId: bigint;
+	liquidity: bigint;
+	amount0: bigint;
+	amount1: bigint;
+	timestamp: number | null;
+}
+
+interface DecreaseLiquidityEvent {
+	blockNumber: number;
+	transactionHash: string;
+	logIndex: number;
+	tokenId: bigint;
+	liquidity: bigint;
+	amount0: bigint;
+	amount1: bigint;
+	timestamp: number | null;
 }
 
 // Streaming version that processes logs without storing them all in memory
@@ -371,6 +397,80 @@ function decodeTransferEvent(log: any): TransferEvent | null {
 	}
 }
 
+function decodeIncreaseLiquidityEvent(log: any): IncreaseLiquidityEvent | null {
+	try {
+		const iface = new ethers.Interface([
+			"event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)",
+		]);
+		
+		// Construct topics array (topic0 is the event signature, topic1 is indexed tokenId)
+		const topics = [log.topic0, log.topic1, log.topic2, log.topic3].filter(Boolean);
+		
+		const decoded = iface.parseLog({
+			topics: topics,
+			data: log.data,
+		});
+
+		if (!decoded) {
+			console.log(`[decodeIncreaseLiquidityEvent] Failed to decode log at block ${log.block_number}, log_index ${log.log_index}`);
+			return null;
+		}
+
+		const decodedEvent = {
+			blockNumber: log.block_number,
+			transactionHash: log.transaction_hash,
+			logIndex: log.log_index,
+			tokenId: decoded.args.tokenId,
+			liquidity: decoded.args.liquidity,
+			amount0: decoded.args.amount0,
+			amount1: decoded.args.amount1,
+			timestamp: log.timestamp,
+		};
+		console.log(`[decodeIncreaseLiquidityEvent] Successfully decoded IncreaseLiquidity event: tx=${decodedEvent.transactionHash}, tokenId=${decodedEvent.tokenId.toString()}`);
+		return decodedEvent;
+	} catch (error) {
+		console.error("[decodeIncreaseLiquidityEvent] Error decoding IncreaseLiquidity event:", error);
+		return null;
+	}
+}
+
+function decodeDecreaseLiquidityEvent(log: any): DecreaseLiquidityEvent | null {
+	try {
+		const iface = new ethers.Interface([
+			"event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)",
+		]);
+		
+		// Construct topics array (topic0 is the event signature, topic1 is indexed tokenId)
+		const topics = [log.topic0, log.topic1, log.topic2, log.topic3].filter(Boolean);
+		
+		const decoded = iface.parseLog({
+			topics: topics,
+			data: log.data,
+		});
+
+		if (!decoded) {
+			console.log(`[decodeDecreaseLiquidityEvent] Failed to decode log at block ${log.block_number}, log_index ${log.log_index}`);
+			return null;
+		}
+
+		const decodedEvent = {
+			blockNumber: log.block_number,
+			transactionHash: log.transaction_hash,
+			logIndex: log.log_index,
+			tokenId: decoded.args.tokenId,
+			liquidity: decoded.args.liquidity,
+			amount0: decoded.args.amount0,
+			amount1: decoded.args.amount1,
+			timestamp: log.timestamp,
+		};
+		console.log(`[decodeDecreaseLiquidityEvent] Successfully decoded DecreaseLiquidity event: tx=${decodedEvent.transactionHash}, tokenId=${decodedEvent.tokenId.toString()}`);
+		return decodedEvent;
+	} catch (error) {
+		console.error("[decodeDecreaseLiquidityEvent] Error decoding DecreaseLiquidity event:", error);
+		return null;
+	}
+}
+
 // Simple CSV escaping - wrap in quotes if contains comma, quote, or newline
 function escapeCsvValue(value: string): string {
 	if (value.includes(',') || value.includes('"') || value.includes('\n')) {
@@ -401,6 +501,10 @@ async function main() {
 	let totalCollectEvents = 0;
 	let matchedMintCount = 0;
 	let unmatchedMintCount = 0;
+	let totalIncreaseLiquidityEvents = 0;
+	let totalDecreaseLiquidityEvents = 0;
+	let matchedIncreaseLiquidityCount = 0;
+	let matchedDecreaseLiquidityCount = 0;
 
 	// Step 1: Fetch and index Transfer events (minimal memory - just tx hash -> first transfer)
 	console.log("Querying Transfer events from NFT contract...");
@@ -432,8 +536,10 @@ async function main() {
 		console.warn(`[main] Warning: Transfer map has ${transferMapByTx.size} entries. This may use significant memory.`);
 	}
 
-	// Step 2: Fetch Mint events, match on-the-fly, and write immediately
+	// Step 2: Fetch and index Mint events (store for matching with IncreaseLiquidity)
 	console.log("Querying Mint events from pool contract...");
+	// Store arrays of mint events per transaction, sorted by log index
+	const mintMapByTx = new Map<string, Array<{ mint: MintEvent; user: string; logIndex: number }>>();
 	await fetchAndProcessLogs(
 		HYPERSYNC_URL,
 		CL_POOL,
@@ -448,6 +554,12 @@ async function main() {
 				const matchingTransfer = transferMapByTx.get(txHash);
 				
 				if (matchingTransfer) {
+					// Store mint event with user for matching with IncreaseLiquidity
+					if (!mintMapByTx.has(txHash)) {
+						mintMapByTx.set(txHash, []);
+					}
+					mintMapByTx.get(txHash)!.push({ mint: decoded, user: matchingTransfer.to, logIndex: decoded.logIndex });
+					
 					// Write matched mint event as CSV row
 					const row = [
 						'mint',
@@ -470,10 +582,16 @@ async function main() {
 			}
 		}
 	);
+	// Sort mint events by log index within each transaction
+	for (const mints of mintMapByTx.values()) {
+		mints.sort((a, b) => a.logIndex - b.logIndex);
+	}
 	console.log(`Processed ${totalMintEvents} Mint events (${matchedMintCount} matched, ${unmatchedMintCount} unmatched)`);
 
-	// Step 3: Fetch Collect events and write immediately
+	// Step 3: Fetch and index Collect events (store for matching with DecreaseLiquidity)
 	console.log("Querying Collect events from pool contract...");
+	// Store arrays of collect events per transaction, sorted by log index
+	const collectMapByTx = new Map<string, Array<CollectEvent>>();
 	await fetchAndProcessLogs(
 		HYPERSYNC_URL,
 		CL_POOL,
@@ -484,6 +602,13 @@ async function main() {
 			const decoded = decodeCollectEvent(log);
 			if (decoded) {
 				totalCollectEvents++;
+				// Store collect event for matching with DecreaseLiquidity
+				const txHash = decoded.transactionHash.toLowerCase();
+				if (!collectMapByTx.has(txHash)) {
+					collectMapByTx.set(txHash, []);
+				}
+				collectMapByTx.get(txHash)!.push(decoded);
+				
 				// Write collect event as CSV row
 				const row = [
 					'collect',
@@ -502,7 +627,123 @@ async function main() {
 			}
 		}
 	);
+	// Sort collect events by log index within each transaction
+	for (const collects of collectMapByTx.values()) {
+		collects.sort((a, b) => a.logIndex - b.logIndex);
+	}
 	console.log(`Processed ${totalCollectEvents} Collect events`);
+
+	// Step 4: Fetch IncreaseLiquidity events and match with Mint events by log index order
+	console.log("Querying IncreaseLiquidity events from pool contract...");
+	// Track matched IncreaseLiquidity events per transaction to match by position
+	const increaseLiquidityMapByTx = new Map<string, Array<IncreaseLiquidityEvent>>();
+	await fetchAndProcessLogs(
+		HYPERSYNC_URL,
+		CL_POOL,
+		INCREASE_LIQUIDITY_EVENT_SIGNATURE,
+		FROM_BLOCK,
+		TO_BLOCK,
+		(log) => {
+			const decoded = decodeIncreaseLiquidityEvent(log);
+			if (decoded) {
+				totalIncreaseLiquidityEvents++;
+				const txHash = decoded.transactionHash.toLowerCase();
+				if (!increaseLiquidityMapByTx.has(txHash)) {
+					increaseLiquidityMapByTx.set(txHash, []);
+				}
+				increaseLiquidityMapByTx.get(txHash)!.push(decoded);
+			}
+		}
+	);
+	// Sort IncreaseLiquidity events by log index within each transaction and match with Mint events
+	for (const [txHash, increaseLiquidityEvents] of increaseLiquidityMapByTx.entries()) {
+		increaseLiquidityEvents.sort((a, b) => a.logIndex - b.logIndex);
+		const mintEvents = mintMapByTx.get(txHash) || [];
+		
+		// Match by position (assuming same order as log index)
+		for (let i = 0; i < increaseLiquidityEvents.length; i++) {
+			const increaseLiquidity = increaseLiquidityEvents[i];
+			const matchingMint = mintEvents[i];
+			
+			if (matchingMint) {
+				// Write IncreaseLiquidity event as CSV row with user from Mint event
+				const row = [
+					'increaseLiquidity',
+					increaseLiquidity.transactionHash,
+					increaseLiquidity.blockNumber.toString(),
+					increaseLiquidity.liquidity.toString(),
+					increaseLiquidity.amount0.toString(),
+					increaseLiquidity.amount1.toString(),
+					matchingMint.user,
+				];
+				const csvRow = row.map(escapeCsvValue).join(',') + '\n';
+				if (!outputFile.write(csvRow)) {
+					// Handle backpressure - wait for drain event
+					outputFile.once('drain', () => {});
+				}
+				matchedIncreaseLiquidityCount++;
+			} else {
+				console.warn(`[main] IncreaseLiquidity event at tx ${increaseLiquidity.transactionHash} (logIndex ${increaseLiquidity.logIndex}) has no matching Mint event at position ${i}`);
+			}
+		}
+	}
+	console.log(`Processed ${totalIncreaseLiquidityEvents} IncreaseLiquidity events (${matchedIncreaseLiquidityCount} matched)`);
+
+	// Step 5: Fetch DecreaseLiquidity events and match with Collect events by log index order
+	console.log("Querying DecreaseLiquidity events from pool contract...");
+	// Track matched DecreaseLiquidity events per transaction to match by position
+	const decreaseLiquidityMapByTx = new Map<string, Array<DecreaseLiquidityEvent>>();
+	await fetchAndProcessLogs(
+		HYPERSYNC_URL,
+		CL_POOL,
+		DECREASE_LIQUIDITY_EVENT_SIGNATURE,
+		FROM_BLOCK,
+		TO_BLOCK,
+		(log) => {
+			const decoded = decodeDecreaseLiquidityEvent(log);
+			if (decoded) {
+				totalDecreaseLiquidityEvents++;
+				const txHash = decoded.transactionHash.toLowerCase();
+				if (!decreaseLiquidityMapByTx.has(txHash)) {
+					decreaseLiquidityMapByTx.set(txHash, []);
+				}
+				decreaseLiquidityMapByTx.get(txHash)!.push(decoded);
+			}
+		}
+	);
+	// Sort DecreaseLiquidity events by log index within each transaction and match with Collect events
+	for (const [txHash, decreaseLiquidityEvents] of decreaseLiquidityMapByTx.entries()) {
+		decreaseLiquidityEvents.sort((a, b) => a.logIndex - b.logIndex);
+		const collectEvents = collectMapByTx.get(txHash) || [];
+		
+		// Match by position (assuming same order as log index)
+		for (let i = 0; i < decreaseLiquidityEvents.length; i++) {
+			const decreaseLiquidity = decreaseLiquidityEvents[i];
+			const matchingCollect = collectEvents[i];
+			
+			if (matchingCollect) {
+				// Write DecreaseLiquidity event as CSV row with recipient from Collect event
+				const row = [
+					'decreaseLiquidity',
+					decreaseLiquidity.transactionHash,
+					decreaseLiquidity.blockNumber.toString(),
+					decreaseLiquidity.liquidity.toString(),
+					decreaseLiquidity.amount0.toString(),
+					decreaseLiquidity.amount1.toString(),
+					matchingCollect.recipient,
+				];
+				const csvRow = row.map(escapeCsvValue).join(',') + '\n';
+				if (!outputFile.write(csvRow)) {
+					// Handle backpressure - wait for drain event
+					outputFile.once('drain', () => {});
+				}
+				matchedDecreaseLiquidityCount++;
+			} else {
+				console.warn(`[main] DecreaseLiquidity event at tx ${decreaseLiquidity.transactionHash} (logIndex ${decreaseLiquidity.logIndex}) has no matching Collect event at position ${i}`);
+			}
+		}
+	}
+	console.log(`Processed ${totalDecreaseLiquidityEvents} DecreaseLiquidity events (${matchedDecreaseLiquidityCount} matched)`);
 
 	// Close the file
 	outputFile.end();
@@ -511,7 +752,7 @@ async function main() {
 	await new Promise((resolve) => outputFile.on('finish', resolve));
 
 	console.log(`[main] Results written to ${outputPath}`);
-	console.log(`Total events: ${matchedMintCount + totalCollectEvents} (${matchedMintCount} matched mints, ${totalCollectEvents} collects)`);
+	console.log(`Total events: ${matchedMintCount + totalCollectEvents + matchedIncreaseLiquidityCount + matchedDecreaseLiquidityCount} (${matchedMintCount} matched mints, ${totalCollectEvents} collects, ${matchedIncreaseLiquidityCount} matched increaseLiquidity, ${matchedDecreaseLiquidityCount} matched decreaseLiquidity)`);
 	console.log("[main] Main function completed successfully");
 }
 
