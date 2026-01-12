@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const FROM_BLOCK = 38766575;
-const TO_BLOCK = 38866575;
+const TO_BLOCK = 40304088;
 
 const HYPERSYNC_API_KEY = process.env.HYPERSYNC_API_KEY;
 // Using chain-id 1 for Ethereum mainnet (adjust if needed)
@@ -62,16 +62,18 @@ interface MatchedMintEvent {
 	transfer: TransferEvent;
 }
 
-async function fetchLogs(
+// Streaming version that processes logs without storing them all in memory
+async function fetchAndProcessLogs(
 	client: string,
 	contractAddress: string,
 	eventTopic: string,
 	startBlock: number,
-	endBlock: number
-): Promise<Array<any>> {
-	console.log(`[fetchLogs] Starting fetch for contract ${contractAddress} from block ${startBlock} to ${endBlock}`);
+	endBlock: number,
+	processCallback: (log: any) => void
+): Promise<number> {
+	console.log(`[fetchAndProcessLogs] Starting fetch for contract ${contractAddress} from block ${startBlock} to ${endBlock}`);
 	let currentBlock = startBlock;
-	let logs: Array<any> = [];
+	let totalProcessed = 0;
 
 	const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 	const isRetryableError = (error: any): boolean => {
@@ -126,42 +128,104 @@ async function fetchLogs(
 	                },
 	              });
 
-				console.log(`[fetchLogs] API response: next_block=${queryResponse.data.next_block}, data length=${queryResponse.data.data?.length || 0}`);
-
-				// Concatenate logs if there are any
-				if (queryResponse.data.data && queryResponse.data.data.length > 0) {
-					console.log(`[fetchLogs] Received ${queryResponse.data.data.length} log entries in this batch`);
-					logs = logs.concat(queryResponse.data.data);
-				}
-
-				// Update currentBlock for the next iteration
 				const nextBlock = queryResponse.data.next_block;
+				const dataArray = queryResponse.data.data || [];
 				
-				// Exit if next_block is invalid or beyond end block
-				if (!nextBlock || nextBlock > endBlock) {
-					console.log(`[fetchLogs] Stopping fetch: next_block=${nextBlock}, currentBlock=${currentBlock}, endBlock=${endBlock}`);
+				console.log(`[fetchLogs] API response: next_block=${nextBlock}, data length=${dataArray.length}`);
+
+				// Find the highest block number in this batch and process logs incrementally
+				let maxBlockInBatch = currentBlock - 1;
+				if (dataArray.length > 0) {
+					// Process each entry immediately to avoid memory buildup
+					let logCount = 0;
+					for (const entry of dataArray) {
+						if (!entry || !entry.logs || !Array.isArray(entry.logs)) {
+							continue;
+						}
+						
+						// Create a map of block_number to timestamp for this entry
+						const blockMap = new Map(
+							(entry.blocks || []).map((block: any) => [block.number, parseInt(block.timestamp, 16)])
+						);
+
+						// Process logs from this entry immediately
+						for (const log of entry.logs) {
+							if (log.block_number && log.block_number > maxBlockInBatch) {
+								maxBlockInBatch = log.block_number;
+							}
+							// Process log immediately via callback instead of storing
+							const processedLog = {
+								...log,
+								timestamp: blockMap.get(log.block_number) || null
+							};
+							processCallback(processedLog);
+							logCount++;
+							totalProcessed++;
+						}
+					}
+					console.log(`[fetchLogs] Received ${dataArray.length} response entries with ${logCount} total logs in this batch, max block: ${maxBlockInBatch}`);
+				}
+
+				// Check if we should continue
+				if (!nextBlock) {
+					console.log(`[fetchLogs] No next_block returned, stopping fetch`);
 					break;
 				}
 				
-				// If next_block equals currentBlock, it means we've reached the end or no more data
-				if (nextBlock === currentBlock) {
-					console.log(`[fetchLogs] next_block equals currentBlock, stopping fetch`);
+				// If next_block is beyond end block, we're done
+				if (nextBlock > endBlock) {
+					console.log(`[fetchLogs] next_block ${nextBlock} exceeds endBlock ${endBlock}, stopping fetch`);
 					break;
 				}
 				
-				currentBlock = nextBlock;
-				console.log(`[fetchLogs] Next block: ${currentBlock}, Total logs so far: ${logs.length}`);
+				// If next_block is less than currentBlock, something is wrong - increment to avoid infinite loop
+				if (nextBlock < currentBlock) {
+					console.warn(`[fetchLogs] next_block ${nextBlock} is less than currentBlock ${currentBlock}, incrementing currentBlock`);
+					currentBlock = currentBlock + 1;
+				}
+				// If next_block equals currentBlock and we got no data, we're done
+				else if (nextBlock === currentBlock && dataArray.length === 0) {
+					console.log(`[fetchLogs] next_block equals currentBlock and no data returned, stopping fetch`);
+					break;
+				}
+				// If next_block equals currentBlock but we got data, increment by 1 to avoid infinite loop
+				else if (nextBlock === currentBlock) {
+					console.log(`[fetchLogs] next_block equals currentBlock but we got data, incrementing to ${currentBlock + 1}`);
+					currentBlock = currentBlock + 1;
+				}
+				// If next_block equals endBlock
+				else if (nextBlock === endBlock) {
+					// If we got no data, we're done
+					if (dataArray.length === 0) {
+						console.log(`[fetchLogs] next_block equals endBlock and no data returned, stopping fetch`);
+						break;
+					}
+					// If we got data but maxBlockInBatch is less than endBlock, there might be more data
+					else if (maxBlockInBatch < endBlock) {
+						console.log(`[fetchLogs] next_block equals endBlock but maxBlockInBatch ${maxBlockInBatch} < endBlock ${endBlock}, continuing from ${maxBlockInBatch + 1}`);
+						currentBlock = maxBlockInBatch + 1;
+					}
+					// If we got data and maxBlockInBatch equals endBlock, we're done
+					else {
+						console.log(`[fetchLogs] next_block equals endBlock and maxBlockInBatch ${maxBlockInBatch} equals endBlock, stopping fetch`);
+						break;
+					}
+				} else {
+					currentBlock = nextBlock;
+				}
+				
+				console.log(`[fetchAndProcessLogs] Next block: ${currentBlock}, Total processed logs so far: ${totalProcessed}`);
 				success = true;
 			} catch (error: any) {
 				if (isRetryableError(error) && retries < maxRetries - 1) {
 					retries++;
 					const delay = Math.min(1000 * Math.pow(2, retries - 1), 10000); // Exponential backoff, max 10s
-					console.log(`[fetchLogs] Retryable error (${error.code || error.response?.status}) at block ${currentBlock}, retrying in ${delay}ms...`);
+					console.log(`[fetchAndProcessLogs] Retryable error (${error.code || error.response?.status}) at block ${currentBlock}, retrying in ${delay}ms...`);
 					await sleep(delay);
 				} else {
-					console.error(`[fetchLogs] Error fetching logs at block ${currentBlock} (attempt ${retries + 1}/${maxRetries}):`, error.code || error.message);
+					console.error(`[fetchAndProcessLogs] Error fetching logs at block ${currentBlock} (attempt ${retries + 1}/${maxRetries}):`, error.code || error.message);
 					if (retries >= maxRetries - 1) {
-						console.error(`[fetchLogs] Max retries reached. Stopping fetch. Total logs collected so far: ${logs.length}`);
+						console.error(`[fetchAndProcessLogs] Max retries reached. Stopping fetch. Total logs collected so far: ${totalProcessed}`);
 						break;
 					}
 					retries++;
@@ -177,21 +241,16 @@ async function fetchLogs(
 		}
 	}
 
-	console.log(`[fetchLogs] Processing ${logs.length} log entries, mapping timestamps...`);
-	const processedLogs = logs.flatMap((entry) => {
-		// Create a map of block_number to timestamp
-		const blockMap = new Map(
-			entry.blocks.map((block: any) => [block.number, parseInt(block.timestamp, 16)])
-		);
+	console.log(`[fetchAndProcessLogs] Completed. Total processed logs: ${totalProcessed}`);
+	return totalProcessed;
+}
 
-		// Map each log with the corresponding timestamp
-		return entry.logs.map((log: any) => ({
-			...log,
-			timestamp: blockMap.get(log.block_number) || null
-		}));
-	});
-	console.log(`[fetchLogs] Completed. Returning ${processedLogs.length} processed logs`);
-	return processedLogs;
+// Simple CSV escaping - wrap in quotes if contains comma, quote, or newline
+function escapeCsvValue(value: string): string {
+	if (value.includes(',') || value.includes('"') || value.includes('\n')) {
+		return '"' + value.replace(/"/g, '""') + '"';
+	}
+	return value;
 }
 
 function decodeMintEvent(log: any): MintEvent | null {
@@ -308,176 +367,185 @@ async function main() {
 	console.log(`[main] Configuration: FROM_BLOCK=${FROM_BLOCK}, TO_BLOCK=${TO_BLOCK}`);
 	console.log(`[main] CL_POOL=${CL_POOL}, NFT_CONTRACT=${NFT_CONTRACT}`);
 	
-	console.log("Querying Mint events from pool contract...");
-	const mintLogs = await fetchLogs(
-		HYPERSYNC_URL,
-		CL_POOL,
-		MINT_EVENT_SIGNATURE,
-		FROM_BLOCK,
-		TO_BLOCK
-	);
-	console.log(`Found ${mintLogs.length} Mint event logs`);
+	const outputPath = path.join(process.cwd(), `events_${CL_POOL}.csv`);
+	const outputFile = fs.createWriteStream(outputPath);
+	
+	// Handle file write errors
+	outputFile.on('error', (err) => {
+		console.error('[main] File write error:', err);
+		process.exit(1);
+	});
+	
+	// Write CSV header
+	const headers = ['type', 'transactionHash', 'blockNumber', 'amount', 'amount0', 'amount1', 'user'];
+	outputFile.write(headers.map(escapeCsvValue).join(',') + '\n');
+	
+	let totalMintEvents = 0;
+	let totalBurnEvents = 0;
+	let matchedMintCount = 0;
+	let unmatchedMintCount = 0;
 
-	console.log("Decoding Mint events...");
-	const mintEvents: MintEvent[] = [];
-	let decodedCount = 0;
-	for (const log of mintLogs) {
-		const decoded = decodeMintEvent(log);
-		if (decoded) {
-			mintEvents.push(decoded);
-			decodedCount++;
-		}
-	}
-	console.log(`Decoded ${decodedCount} out of ${mintLogs.length} Mint events (${mintEvents.length} total in array)`);
-
+	// Step 1: Fetch and index Transfer events (minimal memory - store 'to' address and log index for precise matching)
 	console.log("Querying Transfer events from NFT contract...");
-	const transferLogs = await fetchLogs(
+	// Store transfers with log index for precise matching: tx hash -> array of {to, logIndex}
+	const transferMapByTx = new Map<string, Array<{to: string, logIndex: number}>>();
+	const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+	let transferCount = 0;
+	
+	await fetchAndProcessLogs(
 		HYPERSYNC_URL,
 		NFT_CONTRACT,
 		TRANSFER_EVENT_SIGNATURE,
 		FROM_BLOCK,
-		TO_BLOCK
-	);
-	console.log(`Found ${transferLogs.length} Transfer event logs`);
-
-	console.log("Decoding Transfer events...");
-	const transferEvents: TransferEvent[] = [];
-	let transferDecodedCount = 0;
-	for (const log of transferLogs) {
-		const decoded = decodeTransferEvent(log);
-		if (decoded) {
-			transferEvents.push(decoded);
-			transferDecodedCount++;
+		TO_BLOCK,
+		(log) => {
+			const decoded = decodeTransferEvent(log);
+			if (decoded) {
+				const key = decoded.transactionHash.toLowerCase();
+				// Store all transfer 'to' addresses with log indices per tx where from=0x0 (mint) for matching
+				if (decoded.from.toLowerCase() === ZERO_ADDRESS) {
+					if (!transferMapByTx.has(key)) {
+						transferMapByTx.set(key, []);
+					}
+					transferMapByTx.get(key)!.push({
+						to: decoded.to,
+						logIndex: decoded.logIndex
+					});
+				}
+				transferCount++;
+			}
 		}
+	);
+	console.log(`Processed ${transferCount} Transfer events, indexed ${transferMapByTx.size} unique mint transaction hashes`);
+	
+	// Log memory usage warning if transfer map is very large
+	if (transferMapByTx.size > 100000) {
+		console.warn(`[main] Warning: Transfer map has ${transferMapByTx.size} entries. This may use significant memory.`);
 	}
-	console.log(`Decoded ${transferDecodedCount} out of ${transferLogs.length} Transfer events (${transferEvents.length} total in array)`);
 
+	// Step 2: Fetch Mint events, match on-the-fly, and write immediately
+	console.log("Querying Mint events from pool contract...");
+	await fetchAndProcessLogs(
+		HYPERSYNC_URL,
+		CL_POOL,
+		MINT_EVENT_SIGNATURE,
+		FROM_BLOCK,
+		TO_BLOCK,
+		(log) => {
+			const decoded = decodeMintEvent(log);
+			if (decoded) {
+				totalMintEvents++;
+				const txHash = decoded.transactionHash.toLowerCase();
+				const availableTransfers = transferMapByTx.get(txHash) || [];
+				
+				if (availableTransfers.length > 0) {
+					// Precise matching: find the transfer with the closest log index to the mint's log index
+					// Prefer transfers that come after the mint event (logIndex >= mint.logIndex)
+					// If none found, use the closest one overall
+					let bestMatch: {to: string, logIndex: number} | null = null;
+					let bestDistance = Infinity;
+					
+					for (const transfer of availableTransfers) {
+						const distance = Math.abs(transfer.logIndex - decoded.logIndex);
+						// Prefer transfers that come after the mint (they're more likely to be the result)
+						if (transfer.logIndex >= decoded.logIndex) {
+							if (distance < bestDistance) {
+								bestMatch = transfer;
+								bestDistance = distance;
+							}
+						}
+					}
+					
+					// If no transfer found after mint, use the closest one overall
+					if (!bestMatch) {
+						for (const transfer of availableTransfers) {
+							const distance = Math.abs(transfer.logIndex - decoded.logIndex);
+							if (distance < bestDistance) {
+								bestMatch = transfer;
+								bestDistance = distance;
+							}
+						}
+					}
+					
+					if (bestMatch) {
+						// Write matched mint event as CSV row
+						const row = [
+							'mint',
+							decoded.transactionHash,
+							decoded.blockNumber.toString(),
+							'0',
+							decoded.amount0.toString(),
+							decoded.amount1.toString(),
+							bestMatch.to,
+						];
+						const csvRow = row.map(escapeCsvValue).join(',') + '\n';
+						if (!outputFile.write(csvRow)) {
+							// Handle backpressure - wait for drain event
+							outputFile.once('drain', () => {});
+						}
+						matchedMintCount++;
+						
+						// Log if there are multiple mint transfers and we had to choose
+						if (availableTransfers.length > 1) {
+							console.log(`[main] Matched mint (logIndex=${decoded.logIndex}) with transfer (logIndex=${bestMatch.logIndex}, distance=${bestDistance}) in tx ${decoded.transactionHash}`);
+						}
+						
+						// Remove the matched transfer to avoid reusing it (optional, but helps with multiple mints)
+						const transferIndex = availableTransfers.indexOf(bestMatch);
+						if (transferIndex !== -1) {
+							availableTransfers.splice(transferIndex, 1);
+						}
+					} else {
+						unmatchedMintCount++;
+					}
+				} else {
+					unmatchedMintCount++;
+				}
+			}
+		}
+	);
+	console.log(`Processed ${totalMintEvents} Mint events (${matchedMintCount} matched, ${unmatchedMintCount} unmatched)`);
+
+	// Step 3: Fetch Burn events and write immediately
 	console.log("Querying Burn events from pool contract...");
-	const burnLogs = await fetchLogs(
+	await fetchAndProcessLogs(
 		HYPERSYNC_URL,
 		CL_POOL,
 		BURN_EVENT_SIGNATURE,
 		FROM_BLOCK,
-		TO_BLOCK
+		TO_BLOCK,
+		(log) => {
+			const decoded = decodeBurnEvent(log);
+			if (decoded) {
+				totalBurnEvents++;
+				// Write burn event as CSV row
+				const row = [
+					'burn',
+					decoded.transactionHash,
+					decoded.blockNumber.toString(),
+					'0',
+					decoded.amount0.toString(),
+					decoded.amount1.toString(),
+					decoded.to,
+				];
+				const csvRow = row.map(escapeCsvValue).join(',') + '\n';
+				if (!outputFile.write(csvRow)) {
+					// Handle backpressure - wait for drain event
+					outputFile.once('drain', () => {});
+				}
+			}
+		}
 	);
-	console.log(`Found ${burnLogs.length} Burn event logs`);
+	console.log(`Processed ${totalBurnEvents} Burn events`);
 
-	console.log("Decoding Burn events...");
-	const burnEvents: BurnEvent[] = [];
-	let burnDecodedCount = 0;
-	for (const log of burnLogs) {
-		const decoded = decodeBurnEvent(log);
-		if (decoded) {
-			burnEvents.push(decoded);
-			burnDecodedCount++;
-		}
-	}
-	console.log(`Decoded ${burnDecodedCount} out of ${burnLogs.length} Burn events (${burnEvents.length} total in array)`);
+	// Close the file
+	outputFile.end();
 
-	console.log("Matching Mint events with Transfer events (same transaction hash)...");
-	
-	// Create a map of transfer events by transaction hash for quick lookup
-	console.log(`[main] Building transfer map by transaction hash with ${transferEvents.length} transfer events...`);
-	const transferMapByTx = new Map<string, TransferEvent[]>();
-	for (const transfer of transferEvents) {
-		const key = transfer.transactionHash.toLowerCase();
-		if (!transferMapByTx.has(key)) {
-			transferMapByTx.set(key, []);
-		}
-		transferMapByTx.get(key)!.push(transfer);
-	}
-	console.log(`[main] Transfer map built with ${transferMapByTx.size} unique transaction hashes`);
-	
-	// Log some stats
-	const mintTxHashes = new Set(mintEvents.map(m => m.transactionHash.toLowerCase()));
-	const transferTxHashes = new Set(transferEvents.map(t => t.transactionHash.toLowerCase()));
-	const commonTxHashes = [...mintTxHashes].filter(tx => transferTxHashes.has(tx));
-	console.log(`[main] Found ${commonTxHashes.length} transaction hashes that appear in both mint and transfer events`);
-	if (commonTxHashes.length > 0 && commonTxHashes.length <= 10) {
-		console.log(`[main] Common transaction hashes:`, commonTxHashes);
-	} else if (commonTxHashes.length > 10) {
-		console.log(`[main] First 10 common transaction hashes:`, commonTxHashes.slice(0, 10));
-	}
+	// Wait for file to finish writing
+	await new Promise((resolve) => outputFile.on('finish', resolve));
 
-	// Match Mint events with Transfer events
-	// For v2 pools, minting creates LP tokens, so Transfer events with from=0x0 indicate mints
-	const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
-	const matchedMintEvents: MatchedMintEvent[] = [];
-	let mintMatchedCount = 0;
-	let mintNoMatchCount = 0;
-	
-	for (const mint of mintEvents) {
-		const txHash = mint.transactionHash.toLowerCase();
-		const matchingTransfers = transferMapByTx.get(txHash) || [];
-		
-		// Filter for Transfer events where from is zero address (mint)
-		const mintTransfers = matchingTransfers.filter(t => t.from.toLowerCase() === ZERO_ADDRESS);
-		
-		if (mintTransfers.length > 0) {
-			// Match with the first mint transfer in the same transaction
-			matchedMintEvents.push({ mint, transfer: mintTransfers[0] });
-			mintMatchedCount++;
-			if (mintMatchedCount <= 10) {
-				console.log(`[main] Matched mint tx=${mint.transactionHash} with transfer, sender=${mint.sender}, transfer.to=${mintTransfers[0].to}`);
-			}
-		} else {
-			mintNoMatchCount++;
-			if (mintNoMatchCount <= 10) {
-				console.log(`[main] No matching transfer found for mint tx=${mint.transactionHash}, sender=${mint.sender}`);
-			}
-		}
-	}
-	
-	if (mintMatchedCount > 10) {
-		console.log(`[main] ... and ${mintMatchedCount - 10} more matched mint events`);
-	}
-	if (mintNoMatchCount > 10) {
-		console.log(`[main] ... and ${mintNoMatchCount - 10} more mints with no matching transfers`);
-	}
-
-	console.log(`Matched ${matchedMintEvents.length} mint events (${mintMatchedCount} matched, ${mintNoMatchCount} unmatched)`);
-	console.log(`Found ${burnEvents.length} burn events`);
-
-	// Write to file with new format - BOTH mint and burn events
-	console.log(`[main] Preparing output data for ${matchedMintEvents.length + burnEvents.length} events...`);
-	console.log(`[main] Including ${matchedMintEvents.length} mint events and ${burnEvents.length} burn events`);
-	const outputPath = path.join(process.cwd(), `events_${CL_POOL}.json`);
-	
-	// Format mint events (only matched ones, since we need transfer.to for the user)
-	const mintOutputData = matchedMintEvents.map(({ mint, transfer }) => ({
-		type: "mint",
-		transactionHash: mint.transactionHash,
-		blockNumber: mint.blockNumber,
-		amount: "0", // v2 Mint doesn't have an amount field, only amount0 and amount1
-		amount0: mint.amount0.toString(),
-		amount1: mint.amount1.toString(),
-		user: transfer.to, // For mint, user is the 'to' address from transfer
-	}));
-
-	// Format burn events (ALL burn events, using to field directly)
-	const burnOutputData = burnEvents.map((burn) => ({
-		type: "burn",
-		transactionHash: burn.transactionHash,
-		blockNumber: burn.blockNumber,
-		amount: "0", // v2 Burn doesn't have a single amount field
-		amount0: burn.amount0.toString(),
-		amount1: burn.amount1.toString(),
-		user: burn.to, // For burn, user is the 'to' address from the event
-	}));
-
-	// Combine BOTH mint and burn events, then sort by block number (or transaction hash)
-	const outputData = [...mintOutputData, ...burnOutputData].sort((a, b) => {
-		if (a.blockNumber !== b.blockNumber) {
-			return a.blockNumber - b.blockNumber;
-		}
-		return a.transactionHash.localeCompare(b.transactionHash);
-	});
-
-	console.log(`[main] Writing ${outputData.length} entries to file: ${outputPath}`);
-	console.log(`[main] Breakdown: ${mintOutputData.length} mint events, ${burnOutputData.length} burn events`);
-	fs.writeFileSync(outputPath, JSON.stringify(outputData, null, 2));
-	console.log(`Results written to ${outputPath}`);
-	console.log(`Total events: ${outputData.length} (${matchedMintEvents.length} mints, ${burnEvents.length} burns)`);
+	console.log(`[main] Results written to ${outputPath}`);
+	console.log(`Total events: ${matchedMintCount + totalBurnEvents} (${matchedMintCount} matched mints, ${totalBurnEvents} burns)`);
 	console.log("[main] Main function completed successfully");
 }
 
