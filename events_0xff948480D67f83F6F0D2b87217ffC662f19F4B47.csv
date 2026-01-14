@@ -1,0 +1,2 @@
+type,transactionHash,blockNumber,amount,amount0,amount1,user
+increaseLiquidity,0xbcd665f07b998579ae5462e53702f5eeed6af3b6ffcaf598566de2d4654ca33b,39557654,316042730341918,264720127,1033190788267990502,0xeee7fb850d28f5cabd5f1edf540646b5bea17ce5

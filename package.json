@@ -8,7 +8,9 @@
     },
     "scripts": {
       "test": "echo \"Error: no test specified\" && exit 1",
-      "start": "ts-node src/v2.ts"
+      "start": "ts-node src/v2.ts",
+      "v2": "ts-node src/v2.ts",
+      "v3": "ts-node src/v3.ts"
     },
     "repository": {
       "type": "git",
@@ -26,6 +28,7 @@
       "@typescript-eslint/eslint-plugin": "^6.0.0",
       "@typescript-eslint/parser": "^6.0.0",
       "cbor-web": "^9.0.1",
+      "ts-node": "^10.9.2",
       "typescript": "^5.4.3",
       "typescript-eslint": "^7.3.1"
     },
